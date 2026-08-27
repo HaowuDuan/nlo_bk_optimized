@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nlo-torch"
+version = "0.1.0"
+description = "PyTorch implementation of NLO BK evolution and NLO DIS observables"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+    "ninja>=1.11,<2",
+    "numpy>=2,<3",
+    "torch>=2.6,<3",
+]
+
+[project.scripts]
+nlo-bk = "nlo_torch.cli.nlobk:main"
+nlo-dis = "nlo_torch.cli.nlodis:main"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8,<10",
+    "ruff>=0.9,<1",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"nlo_torch.custom_kernels" = ["*.cu"]
+"nlo_torch.custom_kernels.bk.k1" = ["*.cu"]
+"nlo_torch.custom_kernels.bk.k2_kf" = ["*.cu"]
+"nlo_torch.custom_kernels.dis.i1" = ["*.cu"]
+"nlo_torch.custom_kernels.dis.i2_i3" = ["*.cu"]
+"nlo_torch.custom_kernels.dis.lo_dipole" = ["*.cu"]
+"nlo_torch.custom_kernels.dis.sampling" = ["*.cu"]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+testpaths = ["tests"]
+markers = [
+    "unit: formula and numerical primitive tests",
+    "parity: fixed C++ reference comparisons",
+    "integration: integrated physics-path tests",
+    "e2e: BK-to-DIS workflow tests",
+]
