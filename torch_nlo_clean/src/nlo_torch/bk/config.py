@@ -95,6 +95,10 @@ class BKConfig:
     CUDA_FUSION: bool = True
     K1_FIXED: bool = True
     K1_FIXED_REFINE: bool = False
+    # Carry learned importance grids between related K2/Kf calculations.
+    VEGAS_REUSE_GRID: bool = True
+    # Refresh a reused grid with one quarter of the ordinary warmup.
+    VEGAS_REUSE_WARMUP_FRACTION: float = 0.25
 
     def __post_init__(self) -> None:
         if self.NF not in {0, 3, 5}:
@@ -105,6 +109,8 @@ class BKConfig:
             raise ValueError("integration limits must be positive")
         if self.INTACCURACY <= 0 or self.MCINTACCURACY <= 0:
             raise ValueError("integration accuracies must be positive")
+        if not 0 <= self.VEGAS_REUSE_WARMUP_FRACTION <= 1:
+            raise ValueError("VEGAS_REUSE_WARMUP_FRACTION must lie between zero and one")
         if self.DE_SOLVER_STEP <= 0:
             raise ValueError("DE_SOLVER_STEP must be positive")
         if self.C2 <= 0 or self.KSUB <= 0:

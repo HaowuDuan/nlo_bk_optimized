@@ -129,6 +129,10 @@ Run `nlo-bk --help` or `nlo-dis --help` for all physics and integration options.
   fixed K1, the fused K2/Kf custom producer, and one accepted three-derivative RK2(3) step per
   output interval. The generic GPU Vegas implementation is the fallback when the custom producer
   does not support the requested configuration. Other devices and dtypes use the portable path.
+- K1 evaluates the two panels beside its singular corner in float64, while K2/Kf evaluates and
+  accumulates its disjoint near-cancellation region in float64. Consecutive K2/Kf calculations
+  reuse their learned Vegas grids; reused grids receive 25% of the ordinary warmup (5,000 points
+  at the default 100,000-point production setting) before the unchanged production rounds.
 - Python callers can set `CUDA_FUSION=False`, `K1_FIXED=False`, or `K1_FIXED_REFINE=True` when they
   explicitly need a fallback or comparison implementation; production use needs no backend flag.
 - F2, FL, and FT automatically use the fastest validated DIS implementation for every sector.

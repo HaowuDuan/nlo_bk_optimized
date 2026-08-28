@@ -18,6 +18,7 @@ from nlo_torch.bk.derivatives import (
 )
 from nlo_torch.bk.initial_conditions import MV, ICDataFile
 from nlo_torch.dipole.table import DipoleTable
+from nlo_torch.numerics.integration import VegasState
 from nlo_torch.numerics.interpolation import LogLogSpline
 
 
@@ -94,6 +95,15 @@ def _bk_steps(
     y = float(history_y[-1].item())
     N = history_N[-1]
     h = config.DE_SOLVER_STEP
+    vegas_states = (
+        {}
+        if config.VEGAS_REUSE_GRID
+        and config.CUDA_FUSION
+        and r.is_cuda
+        and r.dtype is torch.float32
+        and config.INTMETHOD_NLO is IntegrationMethod.VEGAS
+        else None
+    )
 
     while True:
         nexty = y + config.DE_SOLVER_STEP
@@ -106,6 +116,7 @@ def _bk_steps(
                 history_N,
                 config,
                 seed=seed,
+                vegas_states=vegas_states,
             )
             N = N + config.DE_SOLVER_STEP * dNdy
             y = nexty
@@ -119,6 +130,7 @@ def _bk_steps(
                 history_N,
                 config,
                 seed,
+                vegas_states=vegas_states,
             )
             y = nexty
         else:
@@ -132,6 +144,7 @@ def _bk_steps(
                 history_N,
                 config,
                 seed,
+                vegas_states=vegas_states,
             )
 
         if not bool(torch.isfinite(N).all()):
@@ -181,6 +194,8 @@ def _fixed_rk23_step(
     history_N: torch.Tensor,
     config: BKConfig,
     seed: int | None,
+    *,
+    vegas_states: dict[int, VegasState] | None = None,
 ) -> torch.Tensor:
     """Apply one accepted GSL RK2(3) step using exactly three derivatives."""
 
@@ -192,6 +207,7 @@ def _fixed_rk23_step(
         history_N,
         config,
         seed=seed,
+        vegas_states=vegas_states,
     )
     midpoint_N = N + 0.5 * step * K1
     K2 = _evolve_derivative(
@@ -202,6 +218,7 @@ def _fixed_rk23_step(
         history_N,
         config,
         seed=seed,
+        vegas_states=vegas_states,
     )
     endpoint_N = N + step * (-K1 + 2.0 * K2)
     K3 = _evolve_derivative(
@@ -212,6 +229,7 @@ def _fixed_rk23_step(
         history_N,
         config,
         seed=seed,
+        vegas_states=vegas_states,
     )
     return N + step * (K1 + 4.0 * K2 + K3) / 6.0
 
@@ -226,11 +244,22 @@ def _adaptive_rk2_to(
     history_N: torch.Tensor,
     config: BKConfig,
     seed: int | None,
+    *,
+    vegas_states: dict[int, VegasState] | None = None,
 ) -> tuple[torch.Tensor, float, float]:
     while y < nexty:
         step = min(h, nexty - y)
         y_tensor = r.new_tensor(y)
-        K1 = _evolve_derivative(N, r, y_tensor, history_y, history_N, config, seed=seed)
+        K1 = _evolve_derivative(
+            N,
+            r,
+            y_tensor,
+            history_y,
+            history_N,
+            config,
+            seed=seed,
+            vegas_states=vegas_states,
+        )
         midpoint_N = N + 0.5 * step * K1
         K2 = _evolve_derivative(
             midpoint_N,
@@ -240,6 +269,7 @@ def _adaptive_rk2_to(
             history_N,
             config,
             seed=seed,
+            vegas_states=vegas_states,
         )
         full_step = N + step * K2
 
@@ -253,6 +283,7 @@ def _adaptive_rk2_to(
             history_N,
             config,
             seed=seed,
+            vegas_states=vegas_states,
         )
         half_N = N + half_step * first_half_K2
         second_half_K1 = _evolve_derivative(
@@ -263,6 +294,7 @@ def _adaptive_rk2_to(
             history_N,
             config,
             seed=seed,
+            vegas_states=vegas_states,
         )
         second_half_midpoint = half_N + 0.5 * half_step * second_half_K1
         second_half_K2 = _evolve_derivative(
@@ -273,6 +305,7 @@ def _adaptive_rk2_to(
             history_N,
             config,
             seed=seed,
+            vegas_states=vegas_states,
         )
         two_half_steps = half_N + half_step * second_half_K2
 
@@ -300,8 +333,18 @@ def _evolve_derivative(
     config: BKConfig,
     *,
     seed: int | None,
+    vegas_states: dict[int, VegasState] | None = None,
 ) -> torch.Tensor:
-    K1, K2_Kf = _derivative_components(rapidity, N, r, history_y, history_N, config, seed=seed)
+    K1, K2_Kf = _derivative_components(
+        rapidity,
+        N,
+        r,
+        history_y,
+        history_N,
+        config,
+        seed=seed,
+        vegas_states=vegas_states,
+    )
     dNdy = K1 + K2_Kf
     return torch.where(torch.isfinite(dNdy), dNdy, torch.zeros_like(dNdy))
 
@@ -315,6 +358,7 @@ def _derivative_components(
     config: BKConfig,
     *,
     seed: int | None,
+    vegas_states: dict[int, VegasState] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     (
         interpolator_N,
@@ -351,6 +395,11 @@ def _derivative_components(
                     config,
                     regular_interpolator_N=interpolator_N,
                     sensitive_interpolator_S=sensitive_interpolator_S,
+                    vegas_state=(
+                        None
+                        if vegas_states is None
+                        else vegas_states.setdefault(rind, VegasState())
+                    ),
                     seed=seed,
                     integration_bounds=integration_bounds,
                 )
@@ -379,6 +428,9 @@ def _derivative_components(
                 config,
                 regular_interpolator_N=interpolator_N,
                 sensitive_interpolator_S=sensitive_interpolator_S,
+                vegas_state=(
+                    None if vegas_states is None else vegas_states.setdefault(rind, VegasState())
+                ),
                 seed=seed,
                 integration_bounds=integration_bounds,
             )

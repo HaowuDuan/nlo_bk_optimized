@@ -18,6 +18,13 @@ class IntegralResult:
     seed: int | None
 
 
+@dataclass(slots=True)
+class VegasState:
+    """Importance grid carried between related Vegas integrals."""
+
+    edges: torch.Tensor | None = None
+
+
 VegasWeightedFunction = Callable[
     [
         torch.Tensor,
@@ -123,9 +130,17 @@ def vegas(
     seed: int | None = None,
     cuda_mask_fusion: bool = False,
     cuda_weighted_function: VegasWeightedFunction | None = None,
+    state: VegasState | None = None,
+    reuse_warmup_fraction: float = 0.0,
     validate_bounds: bool = True,
 ) -> IntegralResult:
-    """Adaptive, importance-sampled Vegas with tensorized sample batches."""
+    """Adaptive, importance-sampled Vegas with tensorized sample batches.
+
+    When ``state`` contains a grid learned by a related earlier integral, that
+    grid initializes the calculation. ``reuse_warmup_fraction`` optionally
+    refreshes it with a fraction of the normal warm-up samples. The final
+    adapted grid is written back to ``state`` for the next call.
+    """
 
     if validate_bounds:
         _validate_bounds(bounds)
@@ -139,6 +154,8 @@ def vegas(
         raise ValueError("min_iterations must lie between one and max_iterations")
     if warmup_samples == 1 or warmup_samples < 0:
         raise ValueError("warmup_samples must be zero or at least two")
+    if not 0 <= reuse_warmup_fraction <= 1:
+        raise ValueError("reuse_warmup_fraction must lie between zero and one")
     if bins < 2 or batch_size < 1:
         raise ValueError("bins and batch_size must be positive")
 
@@ -146,6 +163,25 @@ def vegas(
     generator = torch.Generator(device=bounds.device)
     generator.manual_seed(seed)
     dimensions = bounds.shape[0]
+    reused_state = state is not None and state.edges is not None
+    if reused_state:
+        assert state is not None and state.edges is not None
+        if (
+            state.edges.shape != (dimensions, bins + 1)
+            or state.edges.device != bounds.device
+            or state.edges.dtype is not bounds.dtype
+        ):
+            raise ValueError("Vegas state must match the integration dimensions, bins, and device")
+        if not bool(torch.isfinite(state.edges).all()):
+            raise ValueError("Vegas state edges must be finite")
+        if not bool((state.edges[:, 1:] > state.edges[:, :-1]).all()):
+            raise ValueError("Vegas state edges must be strictly increasing")
+        expected_lower = state.edges.new_zeros(dimensions)
+        expected_upper = state.edges.new_ones(dimensions)
+        if not torch.equal(state.edges[:, 0], expected_lower) or not torch.equal(
+            state.edges[:, -1], expected_upper
+        ):
+            raise ValueError("Vegas state edges must span the unit interval")
     cuda_state_initialization = (
         cuda_mask_fusion
         and bounds.is_cuda
@@ -169,6 +205,9 @@ def vegas(
         bounds_width = bounds[:, 1] - bounds[:, 0]
         volume = torch.prod(bounds_width)
         histogram_semaphores = None
+    if reused_state:
+        assert state is not None and state.edges is not None
+        edges = state.edges.detach().clone()
 
     cuda_kernel_accumulators = cuda_state_initialization and batch_size <= 65_536
     estimates: list[torch.Tensor] = []
@@ -187,10 +226,17 @@ def vegas(
     n_eval = 0
     converged = False
 
-    iterations = max_iterations + int(warmup_samples > 0)
+    effective_warmup_samples = warmup_samples
+    if reused_state:
+        effective_warmup_samples = (
+            max(2, int(warmup_samples * reuse_warmup_fraction))
+            if warmup_samples > 0 and reuse_warmup_fraction > 0
+            else 0
+        )
+    iterations = max_iterations + int(effective_warmup_samples > 0)
     for iteration_index in range(iterations):
-        warmup = warmup_samples > 0 and iteration_index == 0
-        iteration_samples = warmup_samples if warmup else samples_per_iteration
+        warmup = effective_warmup_samples > 0 and iteration_index == 0
+        iteration_samples = effective_warmup_samples if warmup else samples_per_iteration
         if cuda_kernel_accumulators:
             total = bounds.new_empty(())
             total_square = bounds.new_empty(())
@@ -509,6 +555,8 @@ def vegas(
         if converged:
             break
 
+    if state is not None:
+        state.edges = edges.detach().clone()
     return IntegralResult(combined_value, error, n_eval, converged, seed)
 
 
@@ -896,6 +944,7 @@ def _validate_bounds(bounds: torch.Tensor) -> None:
 
 __all__ = [
     "IntegralResult",
+    "VegasState",
     "adaptive_gauss_kronrod_1d",
     "miser",
     "tensor_gauss_legendre",

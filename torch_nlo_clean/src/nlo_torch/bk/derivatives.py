@@ -21,6 +21,7 @@ from nlo_torch.bk_kernels.kf import Kernel_nlo_fermion
 from nlo_torch.coupling import bk_alpha_s
 from nlo_torch.numerics.integration import (
     IntegralResult,
+    VegasState,
     _gauss_kronrod_intervals,
     adaptive_gauss_kronrod_1d,
     miser,
@@ -302,6 +303,7 @@ def rapidity_derivative_nlo(
     *,
     regular_interpolator_N: LogLogSpline | None = None,
     sensitive_interpolator_S: LogLogSpline | None = None,
+    vegas_state: VegasState | None = None,
     seed: int | None = None,
     integration_bounds: torch.Tensor | None = None,
 ) -> IntegralResult:
@@ -394,6 +396,8 @@ def rapidity_derivative_nlo(
             seed=seed,
             cuda_mask_fusion=config.CUDA_FUSION,
             cuda_weighted_function=cuda_weighted_function,
+            state=vegas_state,
+            reuse_warmup_fraction=config.VEGAS_REUSE_WARMUP_FRACTION,
             validate_bounds=False,
         )
 
