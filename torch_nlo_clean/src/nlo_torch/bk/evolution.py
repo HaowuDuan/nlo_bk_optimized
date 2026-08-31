@@ -147,6 +147,8 @@ def _bk_steps(
                 vegas_states=vegas_states,
             )
 
+        if config.FORCE_POSITIVE_N:
+            N = N.clamp(0, 1)
         if not bool(torch.isfinite(N).all()):
             raise FloatingPointError(f"non-finite BK amplitude after rapidity step y={y}")
         history_y = torch.cat((history_y, r.new_tensor([y])))
@@ -387,7 +389,8 @@ def _derivative_components(
             sensitive_interpolator_N=sensitive_interpolator_N,
         )
         if config.Order.has_nlo_kernels:
-            for rind in active_index.detach().cpu().tolist():
+            active_parents = active_index.detach().cpu().tolist()
+            for rind in active_parents:
                 nlo = rapidity_derivative_nlo(
                     r[rind],
                     interpolator_S,
@@ -404,6 +407,53 @@ def _derivative_components(
                     integration_bounds=integration_bounds,
                 )
                 K2_Kf[rind] = nlo.value
+
+            if vegas_states is not None and seed is not None:
+                ready = [
+                    rind
+                    for rind in active_parents
+                    if vegas_states[rind].last_components is not None
+                ]
+                if ready:
+                    components = torch.stack(
+                        tuple(vegas_states[rind].last_components for rind in ready)
+                    )
+                    k1 = K1[ready].double()
+                    scale = k1.abs() + components[:, 0].abs() + components[:, 1].abs()
+                    net = k1 + components[:, 0] + components[:, 1]
+                    condition = scale / torch.maximum(net.abs(), 0.05 * scale)
+                    selected = [
+                        rind
+                        for rind, value in zip(ready, condition.tolist(), strict=True)
+                        if value >= 4.0 or float(N[rind]) > 0.9
+                    ]
+                    for rind in selected:
+                        values = [K2_Kf[rind]]
+                        replica_components = [vegas_states[rind].last_components]
+                        errors = [vegas_states[rind].last_error]
+                        for replica in range(1, 7):
+                            replica_state = VegasState()
+                            estimate = rapidity_derivative_nlo(
+                                r[rind],
+                                interpolator_S,
+                                r,
+                                config,
+                                regular_interpolator_N=interpolator_N,
+                                sensitive_interpolator_S=sensitive_interpolator_S,
+                                vegas_state=replica_state,
+                                seed=seed + 1_000 * replica,
+                                integration_bounds=integration_bounds,
+                            )
+                            values.append(estimate.value)
+                            replica_components.append(replica_state.last_components)
+                            errors.append(replica_state.last_error)
+                        K2_Kf[rind] = torch.stack(values).mean()
+                        vegas_states[rind].last_components = torch.stack(
+                            tuple(replica_components)
+                        ).mean(0)
+                        vegas_states[rind].last_error = (
+                            sum(error * error for error in errors) ** 0.5 / len(errors)
+                        )
         return K1, K2_Kf
 
     K1 = torch.zeros_like(N)

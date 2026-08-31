@@ -369,6 +369,8 @@ def rapidity_derivative_nlo(
             torch.Tensor,
             torch.Tensor,
             torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
         ]:
             return bk_nlo_mixed_vegas_summaries_cuda(
                 r,

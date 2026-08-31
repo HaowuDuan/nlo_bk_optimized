@@ -23,6 +23,8 @@ class VegasState:
     """Importance grid carried between related Vegas integrals."""
 
     edges: torch.Tensor | None = None
+    last_components: torch.Tensor | None = None
+    last_error: float | None = None
 
 
 VegasWeightedFunction = Callable[
@@ -212,6 +214,8 @@ def vegas(
     cuda_kernel_accumulators = cuda_state_initialization and batch_size <= 65_536
     estimates: list[torch.Tensor] = []
     variances: list[torch.Tensor] = []
+    component_estimates: list[torch.Tensor] = []
+    combined_components: torch.Tensor | None = None
     cuda_buffered_summaries = (
         cuda_mask_fusion
         and bounds.is_cuda
@@ -249,6 +253,8 @@ def vegas(
             bin_count = bounds.new_zeros((dimensions, bins))
         sensitive_total = bounds.new_zeros((), dtype=torch.float64)
         sensitive_total_square = bounds.new_zeros((), dtype=torch.float64)
+        component_total = bounds.new_zeros(2, dtype=torch.float64)
+        component_iteration = False
         mixed_precision_iteration = False
         completed = 0
 
@@ -298,14 +304,14 @@ def vegas(
                     if completed == 0 and cuda_kernel_accumulators:
                         total.zero_()
                         total_square.zero_()
-                    if len(weighted_output) == 5:
+                    if len(weighted_output) in {5, 7}:
                         (
                             absolute_weight,
                             regular_sum,
                             regular_square,
                             sensitive_sum,
                             sensitive_square,
-                        ) = weighted_output
+                        ) = weighted_output[:5]
                         if absolute_weight.shape != (count,):
                             raise ValueError("mixed Vegas summaries require one histogram weight")
                         if regular_sum.numel() != 1 or regular_square.numel() != 1:
@@ -331,6 +337,17 @@ def vegas(
                         total_square = total_square + regular_square
                         sensitive_total = sensitive_total + sensitive_sum
                         sensitive_total_square = sensitive_total_square + sensitive_square
+                        if len(weighted_output) == 7:
+                            component_iteration = True
+                            k2_sum, kf_sum = weighted_output[5:]
+                            if k2_sum.numel() != 1 or kf_sum.numel() != 1:
+                                raise ValueError("K2 and Kf Vegas summaries must be scalar")
+                            if (
+                                k2_sum.dtype is not torch.float64
+                                or kf_sum.dtype is not torch.float64
+                            ):
+                                raise TypeError("K2 and Kf Vegas summaries must use float64")
+                            component_total = component_total + torch.stack((k2_sum, kf_sum))
                     elif len(weighted_output) == 2:
                         regular_weight, sensitive_weight = weighted_output
                         if regular_weight.shape != (count,) or sensitive_weight.shape != (count,):
@@ -541,6 +558,8 @@ def vegas(
             )
 
         reported_iterations += 1
+        if component_iteration:
+            component_estimates.append(component_total / iteration_samples)
         if use_buffered_summary:
             combined_value = combined[0]
             error = combined[1]
@@ -550,6 +569,12 @@ def vegas(
             weights = 1 / torch.stack(variances)
             combined_value = torch.sum(weights * torch.stack(estimates)) / weights.sum()
             error = torch.sqrt(1 / weights.sum())
+            if component_estimates:
+                component_stack = torch.stack(component_estimates)
+                component_weights = weights.double().unsqueeze(1)
+                combined_components = torch.sum(
+                    component_weights * component_stack, dim=0
+                ) / component_weights.sum()
         tolerance = max(epsabs, epsrel * abs(float(combined_value.item())))
         converged = reported_iterations >= min_iterations and float(error.item()) <= tolerance
         if converged:
@@ -557,6 +582,10 @@ def vegas(
 
     if state is not None:
         state.edges = edges.detach().clone()
+        state.last_components = (
+            None if combined_components is None else combined_components.detach().clone()
+        )
+        state.last_error = float(error.item())
     return IntegralResult(combined_value, error, n_eval, converged, seed)
 
 

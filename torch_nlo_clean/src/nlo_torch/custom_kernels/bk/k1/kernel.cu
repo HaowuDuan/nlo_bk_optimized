@@ -2037,6 +2037,60 @@ __global__ void k1_sensitive_panels64_kernel(
     }
 }
 
+__global__ void k1_full_grid64_kernel(
+    const float* r_values,
+    double* output,
+    int rows,
+    K1Parameters64 parameters
+) {
+    constexpr int radial_order = 8;
+    constexpr int angular_order = 24;
+    constexpr int samples_per_interval = radial_order * angular_order;
+    __shared__ double warp_totals[8];
+    const int parent = blockIdx.x;
+    const int lane = threadIdx.x % 32;
+    const int warp = threadIdx.x / 32;
+    if (parent >= rows) {
+        return;
+    }
+
+    const int samples = (parameters.grid_points - 1) * samples_per_interval;
+    const double r = static_cast<double>(r_values[parent]);
+    double total = 0.0;
+    for (int sample = threadIdx.x; sample < samples; sample += blockDim.x) {
+        const int interval = sample / samples_per_interval;
+        const int local_sample = sample % samples_per_interval;
+        const int radial_node = local_sample / angular_order;
+        const int angular_node = local_sample % angular_order;
+        const double lower = parameters.log_grid[interval];
+        const double upper = parameters.log_grid[interval + 1];
+        const double center = (lower + upper) / 2.0;
+        const double half_width = (upper - lower) / 2.0;
+        const double log_z = center + half_width * singular_radial_node64(radial_node);
+        const double z = exp(log_z);
+        const double v = (singular_angular_node64(angular_node) + 1.0) / 2.0;
+        const double theta = M_PI * v * v;
+        const double radial_weight =
+            half_width * GaussLegendreRule<radial_order>::weight(radial_node);
+        const double angular_weight =
+            GaussLegendreRule<angular_order>::weight(angular_node) * M_PI * v;
+        total += k1_integrand64(r, z, theta, parameters) *
+            (2.0 * z * z) * radial_weight * angular_weight;
+    }
+    total = warp_sum64(total);
+    if (lane == 0) {
+        warp_totals[warp] = total;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        const double warp_value = lane < 8 ? warp_totals[lane] : 0.0;
+        const double block_total = warp_sum64(warp_value);
+        if (lane == 0) {
+            output[parent] = block_total;
+        }
+    }
+}
+
 __global__ void k1_mixed_finalize_kernel(
     const double* mixed_output,
     float* output,
@@ -2328,29 +2382,6 @@ torch::Tensor mixed_fixed_grid_integrals(
             c64.numel() == a.numel() && d64.numel() == a.numel(),
         "spline coefficients must contain one value per interval"
     );
-
-    int search_steps = 0;
-    for (int values = static_cast<int>(r_grid.numel()) - 1; values > 0; values >>= 1) {
-        ++search_steps;
-    }
-    K1Parameters parameters{
-        r_grid.data_ptr<float>(),
-        log_grid.data_ptr<float>(),
-        a.data_ptr<float>(),
-        b.data_ptr<float>(),
-        c.data_ptr<float>(),
-        d.data_ptr<float>(),
-        static_cast<int>(r_grid.numel()),
-        search_steps,
-        static_cast<float>(nc),
-        static_cast<float>(nf),
-        static_cast<float>(minimum_r),
-        static_cast<float>(ksub),
-        static_cast<float>(coupling_b0),
-        static_cast<float>(coupling_lambda_squared),
-        static_cast<float>(coupling_scale_numerator),
-        static_cast<float>(coupling_log_mu0_term),
-    };
     K1Parameters64 parameters64{
         r_grid64.data_ptr<double>(),
         log_grid64.data_ptr<double>(),
@@ -2373,18 +2404,8 @@ torch::Tensor mixed_fixed_grid_integrals(
     auto output = torch::empty_like(r);
     constexpr int threads = fixed_grid_warps_per_block * 32;
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-    fixed_grid_integrals_kernel<false, true>
-        <<<rows * original_fixed_grid_radial_splits, threads, 0, stream>>>(
-            r.data_ptr<float>(),
-            mixed_output.data_ptr<double>(),
-            mixed_output.data_ptr<double>(),
-            rows,
-            parameters,
-            true
-        );
-    k1_sensitive_panels64_kernel<<<rows, threads, 0, stream>>>(
+    k1_full_grid64_kernel<<<rows, threads, 0, stream>>>(
         r.data_ptr<float>(),
-        parent_index.data_ptr<int64_t>(),
         mixed_output.data_ptr<double>(),
         rows,
         parameters64
@@ -2544,7 +2565,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
     module.def(
         "mixed_fixed_grid_integrals",
         &mixed_fixed_grid_integrals,
-        "Disjoint float32 regular and float64 sensitive fixed-grid K1 integral"
+        "Full-float64 fixed-grid K1 integral"
     );
     module.def("radial_integrals", &radial_integrals, "Persistent adaptive K1 radial integrals");
 }

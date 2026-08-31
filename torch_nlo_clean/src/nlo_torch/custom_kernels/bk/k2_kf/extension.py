@@ -33,7 +33,15 @@ def bk_nlo_mixed_vegas_summaries_cuda(
     config: BKConfig,
     *,
     sensitive_ratio: float = 1e-2,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
     """Return histogram weights and disjoint mixed-precision block moments."""
 
     if config.RC_NLO is not RunningCouplingNLO.SMALLEST_NLO or config.NF > 3:
@@ -68,7 +76,7 @@ def bk_nlo_mixed_vegas_summaries_cuda(
         sensitive_ratio,
         *_bk_physics_arguments(config),
     )
-    return outputs[0], outputs[1], outputs[2], outputs[3], outputs[4]
+    return tuple(outputs)
 
 
 def _bk_physics_arguments(config: BKConfig) -> tuple:

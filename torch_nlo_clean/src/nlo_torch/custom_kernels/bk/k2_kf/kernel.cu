@@ -279,7 +279,13 @@ __device__ __forceinline__ NLOKernels nlo_kernels(
     };
 }
 
-__device__ __forceinline__ float bk_nlo_regular_value32(
+struct NLOIntegrand32 {
+    float total;
+    float k2;
+    float kf;
+};
+
+__device__ __forceinline__ NLOIntegrand32 bk_nlo_regular_value32(
     float r,
     float log_z,
     float log_z2,
@@ -342,11 +348,12 @@ __device__ __forceinline__ float bk_nlo_regular_value32(
     k2_swap = cut_swap ? 0.0F : k2_swap;
     dipole_swap = cut_swap ? 0.0F : dipole_swap;
 
-    float result = symmetrize
+    float k2_result = symmetrize
         ? divide_full(
               add_rn(multiply_rn(k2, dipole), multiply_rn(k2_swap, dipole_swap)), 2.0F
           )
         : multiply_rn(k2, dipole);
+    float kf_result = 0.0F;
     if (nf > 0.0F) {
         const float dipole_f = multiply_rn(sub_rn(1.0F, N_Y), sub_rn(N_X, N_X2));
         const float dipole_f_swap = multiply_rn(
@@ -361,7 +368,7 @@ __device__ __forceinline__ float bk_nlo_regular_value32(
                   2.0F
               )
             : multiply_rn(kernels.kf, dipole_f);
-        result = sub_rn(result, fermion);
+        kf_result = -fermion;
     }
     const float alpha_s = smooth_alpha_s(
         geometry.smallest_distance,
@@ -371,13 +378,18 @@ __device__ __forceinline__ float bk_nlo_regular_value32(
         coupling_log_mu0_term
     );
     const float scaled_alpha_s = multiply_rn(alpha_s, nc);
-    result = multiply_rn(result, multiply_rn(scaled_alpha_s, scaled_alpha_s));
-    result = divide_full(result, normalization_denominator);
-    result = !geometry.invalid && isfinite(result) ? result : 0.0F;
+    float scale = divide_full(
+        multiply_rn(scaled_alpha_s, scaled_alpha_s), normalization_denominator
+    );
     const float jacobian_exponent = add_rn(
         multiply_rn(2.0F, log_z), multiply_rn(2.0F, log_z2)
     );
-    return multiply_rn(result, expf(jacobian_exponent));
+    scale = multiply_rn(scale, expf(jacobian_exponent));
+    k2_result = multiply_rn(k2_result, scale);
+    kf_result = multiply_rn(kf_result, scale);
+    k2_result = !geometry.invalid && isfinite(k2_result) ? k2_result : 0.0F;
+    kf_result = !geometry.invalid && isfinite(kf_result) ? kf_result : 0.0F;
+    return {add_rn(k2_result, kf_result), k2_result, kf_result};
 }
 
 struct Geometry64 {
@@ -541,7 +553,13 @@ __device__ __forceinline__ double smooth_alpha_s64(
     return 1.0 / (b0 * log_argument);
 }
 
-__device__ __forceinline__ double bk_nlo_log_integrand_value64(
+struct NLOIntegrand64 {
+    double total;
+    double k2;
+    double kf;
+};
+
+__device__ __forceinline__ NLOIntegrand64 bk_nlo_log_integrand_value64(
     double r,
     double log_z,
     double log_z2,
@@ -596,16 +614,17 @@ __device__ __forceinline__ double bk_nlo_log_integrand_value64(
     k2_swap = cut_swap ? 0.0 : k2_swap;
     dipole_swap = cut_swap ? 0.0 : dipole_swap;
 
-    double result = symmetrize
+    double k2_result = symmetrize
         ? (k2 * dipole + k2_swap * dipole_swap) / 2.0
         : k2 * dipole;
+    double kf_result = 0.0;
     if (nf > 0.0) {
         const double dipole_f = S_Y * (S_X2 - S_X);
         const double dipole_f_swap = S_Y2 * (S_X - S_X2);
         const double fermion = symmetrize
             ? (kernels.kf * dipole_f + kernels.kf_swap * dipole_f_swap) / 2.0
             : kernels.kf * dipole_f;
-        result -= fermion;
+        kf_result = -fermion;
     }
     const double alpha_s = smooth_alpha_s64(
         geometry.smallest_distance,
@@ -614,10 +633,13 @@ __device__ __forceinline__ double bk_nlo_log_integrand_value64(
         coupling_scale_numerator,
         coupling_log_mu0_term
     );
-    result *= (alpha_s * nc) * (alpha_s * nc);
-    result /= normalization_denominator;
-    result = !geometry.invalid && isfinite(result) ? result : 0.0;
-    return result * exp(2.0 * log_z + 2.0 * log_z2);
+    const double scale = (alpha_s * nc) * (alpha_s * nc) /
+        normalization_denominator * exp(2.0 * log_z + 2.0 * log_z2);
+    k2_result *= scale;
+    kf_result *= scale;
+    k2_result = !geometry.invalid && isfinite(k2_result) ? k2_result : 0.0;
+    kf_result = !geometry.invalid && isfinite(kf_result) ? kf_result : 0.0;
+    return {k2_result + kf_result, k2_result, kf_result};
 }
 
 __global__ void bk_nlo_vegas_region_summaries_kernel(
@@ -645,6 +667,8 @@ __global__ void bk_nlo_vegas_region_summaries_kernel(
     float* __restrict__ regular_block_square,
     double* __restrict__ sensitive_block_sum,
     double* __restrict__ sensitive_block_square,
+    double* __restrict__ k2_block_sum,
+    double* __restrict__ kf_block_sum,
     int samples,
     int grid_points,
     float sensitive_ratio,
@@ -662,8 +686,12 @@ __global__ void bk_nlo_vegas_region_summaries_kernel(
     __shared__ float regular_square[128];
     __shared__ double sensitive_sum[128];
     __shared__ double sensitive_square[128];
+    __shared__ double k2_sum[128];
+    __shared__ double kf_sum[128];
     float regular_value = 0.0F;
     double sensitive_value = 0.0;
+    double k2_value = 0.0;
+    double kf_value = 0.0;
     float x[4];
     float width[4];
     if (sample < samples) {
@@ -687,7 +715,7 @@ __global__ void bk_nlo_vegas_region_summaries_kernel(
             r_ptr[0], x[0], x[1], x[2], x[3], sensitive_ratio
         );
         if (sensitive) {
-            const double integrand = bk_nlo_log_integrand_value64(
+            const NLOIntegrand64 integrand = bk_nlo_log_integrand_value64(
                 static_cast<double>(r_ptr[0]),
                 static_cast<double>(x[0]),
                 static_cast<double>(x[1]),
@@ -714,11 +742,13 @@ __global__ void bk_nlo_vegas_region_summaries_kernel(
                 (32.0 * static_cast<double>(width[1])) *
                 (32.0 * static_cast<double>(width[2])) *
                 (32.0 * static_cast<double>(width[3]));
-            sensitive_value =
-                integrand * static_cast<double>(volume[0]) * inverse_density;
+            const double weight = static_cast<double>(volume[0]) * inverse_density;
+            sensitive_value = integrand.total * weight;
+            k2_value = integrand.k2 * weight;
+            kf_value = integrand.kf * weight;
             absolute_weight[sample] = static_cast<float>(fabs(sensitive_value));
         } else {
-            const float integrand = bk_nlo_regular_value32(
+            const NLOIntegrand32 integrand = bk_nlo_regular_value32(
                 r_ptr[0],
                 x[0],
                 x[1],
@@ -748,8 +778,11 @@ __global__ void bk_nlo_vegas_region_summaries_kernel(
                 multiply_rn(multiply_rn(density_0, density_1), density_2), density_3
             );
             regular_value = multiply_rn(
-                multiply_rn(integrand, volume[0]), inverse_density
+                multiply_rn(integrand.total, volume[0]), inverse_density
             );
+            const float weight = multiply_rn(volume[0], inverse_density);
+            k2_value = static_cast<double>(multiply_rn(integrand.k2, weight));
+            kf_value = static_cast<double>(multiply_rn(integrand.kf, weight));
             absolute_weight[sample] = fabsf(regular_value);
         }
     }
@@ -757,6 +790,8 @@ __global__ void bk_nlo_vegas_region_summaries_kernel(
     regular_square[threadIdx.x] = multiply_rn(regular_value, regular_value);
     sensitive_sum[threadIdx.x] = sensitive_value;
     sensitive_square[threadIdx.x] = sensitive_value * sensitive_value;
+    k2_sum[threadIdx.x] = k2_value;
+    kf_sum[threadIdx.x] = kf_value;
     __syncthreads();
 
 #pragma unroll
@@ -770,6 +805,8 @@ __global__ void bk_nlo_vegas_region_summaries_kernel(
             );
             sensitive_sum[threadIdx.x] += sensitive_sum[threadIdx.x + offset];
             sensitive_square[threadIdx.x] += sensitive_square[threadIdx.x + offset];
+            k2_sum[threadIdx.x] += k2_sum[threadIdx.x + offset];
+            kf_sum[threadIdx.x] += kf_sum[threadIdx.x + offset];
         }
         __syncthreads();
     }
@@ -778,6 +815,8 @@ __global__ void bk_nlo_vegas_region_summaries_kernel(
         regular_block_square[blockIdx.x] = regular_square[0];
         sensitive_block_sum[blockIdx.x] = sensitive_sum[0];
         sensitive_block_square[blockIdx.x] = sensitive_square[0];
+        k2_block_sum[blockIdx.x] = k2_sum[0];
+        kf_block_sum[blockIdx.x] = kf_sum[0];
     }
 }
 
@@ -786,21 +825,29 @@ __global__ void bk_nlo_vegas_region_totals_kernel(
     const float* __restrict__ regular_block_square,
     const double* __restrict__ sensitive_block_sum,
     const double* __restrict__ sensitive_block_square,
+    const double* __restrict__ k2_block_sum,
+    const double* __restrict__ kf_block_sum,
     float* __restrict__ regular_total,
     float* __restrict__ regular_total_square,
     double* __restrict__ sensitive_total,
     double* __restrict__ sensitive_total_square,
+    double* __restrict__ k2_total,
+    double* __restrict__ kf_total,
     int blocks
 ) {
     __shared__ float regular_sum[512];
     __shared__ float regular_square[512];
     __shared__ double sensitive_sum[512];
     __shared__ double sensitive_square[512];
+    __shared__ double k2_sum[512];
+    __shared__ double kf_sum[512];
     const int index = threadIdx.x;
     regular_sum[index] = index < blocks ? regular_block_sum[index] : 0.0F;
     regular_square[index] = index < blocks ? regular_block_square[index] : 0.0F;
     sensitive_sum[index] = index < blocks ? sensitive_block_sum[index] : 0.0;
     sensitive_square[index] = index < blocks ? sensitive_block_square[index] : 0.0;
+    k2_sum[index] = index < blocks ? k2_block_sum[index] : 0.0;
+    kf_sum[index] = index < blocks ? kf_block_sum[index] : 0.0;
     __syncthreads();
 
 #pragma unroll
@@ -812,6 +859,8 @@ __global__ void bk_nlo_vegas_region_totals_kernel(
             );
             sensitive_sum[index] += sensitive_sum[index + offset];
             sensitive_square[index] += sensitive_square[index + offset];
+            k2_sum[index] += k2_sum[index + offset];
+            kf_sum[index] += kf_sum[index + offset];
         }
         __syncthreads();
     }
@@ -820,6 +869,8 @@ __global__ void bk_nlo_vegas_region_totals_kernel(
         regular_total_square[0] = regular_square[0];
         sensitive_total[0] = sensitive_sum[0];
         sensitive_total_square[0] = sensitive_square[0];
+        k2_total[0] = k2_sum[0];
+        kf_total[0] = kf_sum[0];
     }
 }
 
@@ -935,10 +986,14 @@ std::vector<torch::Tensor> bk_nlo_mixed_vegas_summaries(
         {blocks}, random.options().dtype(torch::kFloat64)
     );
     auto sensitive_block_square = torch::empty_like(sensitive_block_sum);
+    auto k2_block_sum = torch::empty_like(sensitive_block_sum);
+    auto kf_block_sum = torch::empty_like(sensitive_block_sum);
     auto regular_sum = torch::empty({}, random.options());
     auto regular_square = torch::empty({}, random.options());
     auto sensitive_sum = torch::empty({}, random.options().dtype(torch::kFloat64));
     auto sensitive_square = torch::empty_like(sensitive_sum);
+    auto k2_sum = torch::empty_like(sensitive_sum);
+    auto kf_sum = torch::empty_like(sensitive_sum);
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
     bk_nlo_vegas_region_summaries_kernel<<<blocks, threads, 0, stream>>>(
         r.data_ptr<float>(),
@@ -965,6 +1020,8 @@ std::vector<torch::Tensor> bk_nlo_mixed_vegas_summaries(
         regular_block_square.data_ptr<float>(),
         sensitive_block_sum.data_ptr<double>(),
         sensitive_block_square.data_ptr<double>(),
+        k2_block_sum.data_ptr<double>(),
+        kf_block_sum.data_ptr<double>(),
         samples,
         r_grid64.numel(),
         static_cast<float>(sensitive_ratio),
@@ -982,10 +1039,14 @@ std::vector<torch::Tensor> bk_nlo_mixed_vegas_summaries(
         regular_block_square.data_ptr<float>(),
         sensitive_block_sum.data_ptr<double>(),
         sensitive_block_square.data_ptr<double>(),
+        k2_block_sum.data_ptr<double>(),
+        kf_block_sum.data_ptr<double>(),
         regular_sum.data_ptr<float>(),
         regular_square.data_ptr<float>(),
         sensitive_sum.data_ptr<double>(),
         sensitive_square.data_ptr<double>(),
+        k2_sum.data_ptr<double>(),
+        kf_sum.data_ptr<double>(),
         blocks
     );
     C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -995,6 +1056,8 @@ std::vector<torch::Tensor> bk_nlo_mixed_vegas_summaries(
         regular_square,
         sensitive_sum,
         sensitive_square,
+        k2_sum,
+        kf_sum,
     };
 }
 

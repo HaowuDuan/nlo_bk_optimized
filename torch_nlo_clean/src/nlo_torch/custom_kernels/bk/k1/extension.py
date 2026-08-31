@@ -151,7 +151,7 @@ def k1_mixed_fixed_grid_integrals_cuda(
     r_grid: torch.Tensor,
     config: BKConfig,
 ) -> torch.Tensor:
-    """Evaluate disjoint regular FP32 and sensitive FP64 K1 panels."""
+    """Evaluate the production fixed-grid K1 integral in float64."""
 
     if not r.is_cuda or r.dtype is not torch.float32 or r.ndim != 1 or not r.is_contiguous():
         raise ValueError("mixed fixed-grid K1 requires contiguous one-dimensional CUDA float32 r")
